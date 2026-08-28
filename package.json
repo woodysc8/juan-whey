@@ -1,0 +1,18 @@
+{
+  "name": "juan-whey",
+  "version": "1.0.0",
+  "description": "Juan Whey - deterministic travel-research MCP server. No LLM calls, no per-message billing. Flight/hotel/activity search via Amadeus free tier, plus deterministic cost/PTO/rewards math and persistent traveler profile + trip state.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/run.js",
+    "diagnose:flight": "node scripts/diagnose-serpapi-flight.js",
+    "diagnose:letsfg": "node scripts/diagnose-letsfg-flight.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "zod": "^3.25.76"
+  }
+}
