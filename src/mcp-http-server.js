@@ -5,8 +5,11 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createJuanMcpServer } from "./mcpFactory.js";
+import { AuthenticationError, createOidcTokenValidator, loadOidcAuthConfig } from "./auth/oidc.js";
 
 const DEFAULTS = { maxBodyBytes: 1_000_000, maxConcurrentRequests: 10, maxSessions: 10, requestTimeoutMs: 30_000 };
+const DEFAULT_LOCAL_HOST = "127.0.0.1";
+const DEFAULT_LOCAL_PORT = 3100;
 
 function csv(value) { return String(value || "").split(",").map((item) => item.trim()).filter(Boolean); }
 function positiveInteger(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback; }
@@ -42,20 +45,22 @@ async function readJsonBody(request, maxBytes) {
 
 /** Read explicit HTTP configuration. Non-local unauthenticated binding is rejected. */
 export function loadMcpHttpConfig(env = process.env) {
-  const host = String(env.MCP_HTTP_HOST || "").trim();
-  const port = Number(env.MCP_HTTP_PORT);
+  const host = String(env.MCP_HTTP_HOST || DEFAULT_LOCAL_HOST).trim();
+  const requestedPort = env.MCP_HTTP_PORT || env.PORT || DEFAULT_LOCAL_PORT;
+  const port = Number(requestedPort);
   const publicBaseUrl = String(env.MCP_PUBLIC_BASE_URL || "").trim();
   const allowedOrigins = csv(env.MCP_ALLOWED_ORIGINS);
   const allowedHosts = csv(env.MCP_ALLOWED_HOSTS);
   const authRequired = String(env.MCP_AUTH_REQUIRED || "").trim().toLowerCase();
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535 || !publicBaseUrl || !allowedOrigins.length || !allowedHosts.length || !["true", "false"].includes(authRequired)) {
-    throw new Error("MCP HTTP configuration requires MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_PUBLIC_BASE_URL, MCP_ALLOWED_ORIGINS, MCP_ALLOWED_HOSTS, and MCP_AUTH_REQUIRED.");
+    throw new Error("MCP HTTP configuration requires MCP_PUBLIC_BASE_URL, MCP_ALLOWED_ORIGINS, MCP_ALLOWED_HOSTS, and MCP_AUTH_REQUIRED. MCP_HTTP_PORT falls back to PORT, then 3100.");
   }
   try { new URL(publicBaseUrl); } catch { throw new Error("MCP_PUBLIC_BASE_URL must be an absolute URL."); }
   if (allowedOrigins.includes("*") || allowedHosts.includes("*")) throw new Error("MCP HTTP allowlists must be explicit; '*' is not permitted.");
   if (authRequired === "false" && !isLoopback(host)) throw new Error("Refusing to bind an unauthenticated MCP HTTP server to a non-loopback host.");
+  const auth = authRequired === "true" ? loadOidcAuthConfig(env) : null;
   return {
-    host, port, publicBaseUrl, allowedOrigins, allowedHosts, authRequired: authRequired === "true",
+    host, port, publicBaseUrl, allowedOrigins, allowedHosts, authRequired: authRequired === "true", auth,
     maxBodyBytes: positiveInteger(env.MCP_HTTP_MAX_BODY_BYTES, DEFAULTS.maxBodyBytes),
     maxConcurrentRequests: positiveInteger(env.MCP_HTTP_MAX_CONCURRENT_REQUESTS, DEFAULTS.maxConcurrentRequests),
     maxSessions: positiveInteger(env.MCP_HTTP_MAX_SESSIONS, DEFAULTS.maxSessions),
@@ -67,16 +72,21 @@ export function loadMcpHttpConfig(env = process.env) {
  * Creates a stateful Streamable HTTP adapter around the existing MCP factory.
  * It does not add or duplicate Juan tool logic.
  */
-export function createJuanMcpHttpServer({ config = loadMcpHttpConfig(), createMcpServer = createJuanMcpServer, logger = console } = {}) {
+export function createJuanMcpHttpServer({ config = loadMcpHttpConfig(), createMcpServer = createJuanMcpServer, authValidator, logger = console } = {}) {
   const sessions = new Map();
   let activeRequests = 0;
+  let validateAuthorization = authValidator;
+  if (config.authRequired && !validateAuthorization) {
+    try { validateAuthorization = createOidcTokenValidator(config.auth); }
+    catch { validateAuthorization = async () => { throw new AuthenticationError(503, "OAuth/OIDC authentication is not configured."); }; }
+  }
   async function closeSession(sessionId) {
     const session = sessions.get(sessionId);
     if (!session || session.closing) return;
     session.closing = true; sessions.delete(sessionId);
     await Promise.allSettled([session.transport.close(), session.server.close()]);
   }
-  function requestIsAllowed(request, response) {
+  async function requestIsAllowed(request, response) {
     const receivedHost = String(request.headers.host || "");
     const receivedHostName = hostName(receivedHost);
     const allowedHost = config.allowedHosts.includes(receivedHost) || config.allowedHosts.map((item) => hostName(item) || item.toLowerCase()).includes(receivedHostName);
@@ -84,17 +94,21 @@ export function createJuanMcpHttpServer({ config = loadMcpHttpConfig(), createMc
     const origin = request.headers.origin;
     if (origin && !config.allowedOrigins.includes(String(origin))) { safeLog(logger, "rejected disallowed origin"); jsonError(response, 403, "Origin is not allowed."); return false; }
     if (config.authRequired) {
-      const authorization = request.headers.authorization;
-      if (!authorization) { safeLog(logger, "rejected missing authentication"); response.setHeader("www-authenticate", "Bearer"); jsonError(response, 401, "Authentication is required."); return false; }
-      // No issuer/JWKS validator is configured in this repository. Do not accept unverified tokens.
-      safeLog(logger, "rejected unconfigured token validation"); jsonError(response, 503, "OAuth/OIDC token validation is not configured."); return false;
+      try { await validateAuthorization(request.headers.authorization); }
+      catch (error) {
+        const status = error instanceof AuthenticationError ? error.statusCode : 503;
+        if (error instanceof AuthenticationError && error.wwwAuthenticate) response.setHeader("www-authenticate", error.wwwAuthenticate);
+        safeLog(logger, status === 403 ? "rejected missing required scope" : status === 401 ? "rejected invalid authentication" : "rejected invalid authentication configuration");
+        jsonError(response, status, error instanceof AuthenticationError ? error.message : "OAuth/OIDC authentication is not configured.");
+        return false;
+      }
     }
     return true;
   }
   const httpServer = createServer(async (request, response) => {
     const path = new URL(request.url || "/", "http://localhost").pathname;
     if (path !== "/mcp") { jsonError(response, 404, "Not found."); return; }
-    if (!requestIsAllowed(request, response)) return;
+    if (!(await requestIsAllowed(request, response))) return;
     if (activeRequests >= config.maxConcurrentRequests) { safeLog(logger, "rejected concurrency limit"); jsonError(response, 429, "Too many concurrent MCP requests."); return; }
     activeRequests += 1;
     const timeout = setTimeout(() => {

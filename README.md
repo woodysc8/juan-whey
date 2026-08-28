@@ -34,7 +34,7 @@ npm run mcp:http
 
 It exposes the MCP SDK's Streamable HTTP endpoint at `/mcp`, using the explicit `MCP_HTTP_*` configuration in `.env`. Host and Origin allowlists are mandatory; wildcard values are rejected. `MCP_AUTH_REQUIRED=false` is accepted only when binding to a loopback host.
 
-This is **not public-deployment ready**: when `MCP_AUTH_REQUIRED=true`, requests without credentials receive `401`, while presented bearer tokens receive `503` until a real OAuth/OIDC resource-server validator is configured. The server never accepts an unverified token.
+For authenticated remote use, set `MCP_AUTH_REQUIRED=true` plus `MCP_AUTH_ISSUER`, `MCP_AUTH_AUDIENCE`, and `MCP_AUTH_JWKS_URL`. Configure at least one authorization restriction: comma-separated `MCP_AUTH_REQUIRED_SCOPES` and/or comma-separated `MCP_AUTH_ALLOWED_SUBJECTS`. Every request must provide a signed, unexpired bearer JWT from that issuer with the configured audience; configured scopes and subjects are both enforced. For Google service-account ID tokens, leave scopes empty and use the immutable JWT `sub` value in `MCP_AUTH_ALLOWED_SUBJECTS`. The server verifies signatures using the configured JWKS and never accepts an unverified token. `MCP_HTTP_PORT` takes precedence; when omitted it falls back to `PORT` (then local port `3100`).
 
 The initial HTTP adapter is intended for one authenticated owner, one running instance, and one durable private `data/` volume. JSON profile/trip storage and in-memory Trip Intent are not multi-user or horizontally scaled storage.
 
