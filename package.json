@@ -6,7 +6,9 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/run.js",
+    "mcp": "node src/mcp-server.js",
+    "mcp:http": "node src/mcp-http-server.js",
+    "test": "node test/run.js && node test/mcp-smoke.js && node test/mcp-http-smoke.js",
     "diagnose:flight": "node scripts/diagnose-serpapi-flight.js",
     "diagnose:letsfg": "node scripts/diagnose-letsfg-flight.js"
   },
