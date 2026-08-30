@@ -12,6 +12,7 @@ import { estimateTripEconomics, compareTripEconomics } from "../src/research/tri
 import { searchHotels as searchStayingApiHotels, normalizeStayingApiHotel } from "../src/providers/hotels/stayingapi.js";
 import { compareHotels } from "../src/research/hotelComparison.js";
 import { recommendTripOptions } from "../src/research/tripDecision.js";
+import { searchAirports } from "../src/tools/airports.js";
 
 let passed = 0;
 function test(name, fn) {
@@ -41,6 +42,32 @@ const originalProfile = await getProfile();
 const originalEnv = Object.fromEntries(["LETSFG_BEARER_TOKEN", "SERPAPI_API_KEY", "STAYINGAPI_KEY", "STAYINGAPI_TIMEOUT_MS", "MAX_DESTINATION_CANDIDATES", "MAX_FLIGHT_PROVIDERS_PER_DESTINATION", "MAX_HOTEL_PROPERTIES"].map((key) => [key, process.env[key]]));
 function response(status, body) { return { ok: status >= 200 && status < 300, status, json: async () => body }; }
 const letsFgOffer = { id: "off_test", price: 499, currency: "USD", airlines: ["Test Air"], outbound: { stopovers: 0, total_duration_seconds: 7200, segments: [{ airline: "Test Air", flight_no: "TA101", origin: "PVD", destination: "MIA", departure: "2026-11-19T08:00:00", arrival: "2026-11-19T10:00:00", duration_seconds: 7200 }] }, conditions: { refund_before_departure: "allowed_with_fee" } };
+
+console.log("searchAirports");
+await atest("airport autocomplete uses the existing SerpApi Google Flights provider, not Amadeus", async () => {
+  process.env.SERPAPI_API_KEY = "serp-test";
+  const originalFetch = global.fetch;
+  let requestedUrl;
+  global.fetch = async (url) => {
+    requestedUrl = new URL(url);
+    return response(200, {
+      suggestions: [{
+        name: "Miami, FL, USA", type: "city", airports: [
+          { name: "Miami International Airport", id: "MIA", city: "Miami" },
+          { name: "Miami International Airport duplicate", id: "MIA", city: "Miami" },
+        ],
+      }],
+    });
+  };
+  try {
+    const result = await searchAirports({ keyword: "Miami" });
+    assert.equal(requestedUrl.searchParams.get("engine"), "google_flights_autocomplete");
+    assert.equal(requestedUrl.searchParams.get("q"), "Miami");
+    assert.deepEqual(result, { query: "Miami", results: [{ name: "Miami International Airport", iataCode: "MIA", type: "AIRPORT", cityName: "Miami", countryName: null }] });
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
 
 console.log("calculateTotals");
 test("gross/friendsOwe/eventual split (brief example: $1600 trip, friends owe $800)", () => {
