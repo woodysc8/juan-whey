@@ -111,7 +111,10 @@ async function safeGeminiErrorDetails(result) {
 async function getMcpIdToken(googleAuth, audience) {
   const client = await googleAuth.getIdTokenClient(audience);
   const headers = await client.getRequestHeaders();
-  const authorization = headers.Authorization || headers.authorization;
+  // google-auth-library returns a Web Headers instance here, not a plain object.
+  const authorization = typeof headers?.get === "function"
+    ? headers.get("authorization")
+    : headers?.Authorization || headers?.authorization;
   if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
     throw new Error("Cloud Run service identity did not provide an ID token.");
   }

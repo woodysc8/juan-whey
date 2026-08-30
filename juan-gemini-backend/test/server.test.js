@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const test = require("node:test");
-const { callGemini, createApp, loadConfig } = require("../server.js");
+const { callGemini, createApp, getMcpIdToken, loadConfig } = require("../server.js");
 
 const config = {
   geminiApiKey: "test-key-not-a-real-secret",
@@ -18,6 +18,15 @@ const config = {
 test("configuration requires an explicit MCP tool allowlist", () => {
   assert.throws(() => loadConfig({ GEMINI_API_KEY: "test", GEMINI_MODEL: "model", JUAN_MCP_ALLOWED_TOOLS: "" }), /JUAN_MCP_ALLOWED_TOOLS/);
   assert.throws(() => loadConfig({ GEMINI_API_KEY: "test", GEMINI_MODEL: "model", JUAN_MCP_ALLOWED_TOOLS: "calculate_totals", GOOGLE_APPLICATION_CREDENTIALS: "key.json" }), /GOOGLE_APPLICATION_CREDENTIALS/);
+});
+
+test("Cloud Run ID token client uses the Google Auth Headers contract", async () => {
+  const googleAuth = { getIdTokenClient: async (audience) => {
+    assert.equal(audience, config.juanMcpAudience);
+    return { getRequestHeaders: async () => new Headers({ authorization: "Bearer synthetic-id-token" }) };
+  } };
+
+  assert.equal(await getMcpIdToken(googleAuth, config.juanMcpAudience), "synthetic-id-token");
 });
 
 test("Gemini request contains a fresh server-side MCP token and explicit allowlist", async () => {
