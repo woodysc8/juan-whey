@@ -33,11 +33,35 @@ test("Gemini request contains a fresh server-side MCP token and explicit allowli
       const body = JSON.parse(options.body);
       assert.equal(options.headers["x-goog-api-key"], config.geminiApiKey);
       assert.equal(body.tools[0].headers.Authorization, "Bearer synthetic-id-token");
-      assert.deepEqual(body.tools[0].allowed_tools, [{ tools: config.allowedTools }]);
+      assert.deepEqual(body.tools[0].allowed_tools, { mode: "auto", tools: config.allowedTools });
       return { ok: true, json: async () => ({ id: "interaction-1", status: "completed", output_text: "Here are options." }) };
     },
   });
   assert.deepEqual(result, { interactionId: "interaction-1", outputText: "Here are options.", status: "completed", previousInteractionId: "interaction-1" });
+});
+
+test("Gemini upstream failure logs safe status and details without credentials", async () => {
+  const logs = [];
+  const googleAuth = { getIdTokenClient: async () => ({ getRequestHeaders: async () => ({ Authorization: "Bearer sensitive-mcp-token" }) }) };
+  let upstreamError;
+  try {
+    await callGemini({ config, googleAuth, message: "test", fetchImpl: async () => ({ ok: false, status: 400, text: async () => JSON.stringify({ error: { message: "bad request", api_key: "must-not-log" } }) }) });
+  } catch (error) { upstreamError = error; }
+  assert.equal(upstreamError.status, 400);
+  assert.match(upstreamError.details, /\[REDACTED\]/);
+
+  const app = createApp({ config, geminiCall: async () => { throw upstreamError; }, logger: { error(message) { logs.push(message); } } });
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "test" }) });
+    assert.equal(response.status, 502);
+    assert.match(logs.join("\n"), /HTTP 400/);
+    assert.equal(logs.join("\n").includes("must-not-log"), false);
+    assert.equal(logs.join("\n").includes("sensitive-mcp-token"), false);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("health and chat endpoints validate requests without provider calls", async () => {

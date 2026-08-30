@@ -11,6 +11,14 @@ const MAX_MESSAGE_LENGTH = 12_000;
 const MAX_REQUEST_BYTES = "32kb";
 const GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
+class GeminiUpstreamError extends Error {
+  constructor(status, details) {
+    super(`Gemini request failed with HTTP ${status}.`);
+    this.status = status;
+    this.details = details;
+  }
+}
+
 function csv(value) {
   return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -74,6 +82,28 @@ function extractOutputText(interaction) {
   return null;
 }
 
+function redactSensitiveText(value) {
+  return String(value)
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[REDACTED]")
+    .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED]")
+    .replace(/([?&](?:key|api_key)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function sanitizeUpstreamValue(value) {
+  if (Array.isArray(value)) return value.map(sanitizeUpstreamValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /authorization|token|key|secret|credential/i.test(key) ? "[REDACTED]" : sanitizeUpstreamValue(item)]));
+  }
+  return typeof value === "string" ? redactSensitiveText(value) : value;
+}
+
+async function safeGeminiErrorDetails(result) {
+  const text = (await result.text()).slice(0, 4_000);
+  if (!text) return "No response body.";
+  try { return JSON.stringify(sanitizeUpstreamValue(JSON.parse(text))); }
+  catch { return redactSensitiveText(text); }
+}
+
 async function getMcpIdToken(googleAuth, audience) {
   const client = await googleAuth.getIdTokenClient(audience);
   const headers = await client.getRequestHeaders();
@@ -94,7 +124,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
       name: "juan_mcp",
       url: config.juanMcpUrl,
       headers: { Authorization: `Bearer ${mcpToken}` },
-      allowed_tools: [{ tools: config.allowedTools }],
+      allowed_tools: { mode: "auto", tools: config.allowedTools },
     }],
   };
   if (previousInteractionId) body.previous_interaction_id = previousInteractionId;
@@ -108,7 +138,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
       body: JSON.stringify(body),
       signal: abort.signal,
     });
-    if (!result.ok) throw new Error(`Gemini request failed with HTTP ${result.status}.`);
+    if (!result.ok) throw new GeminiUpstreamError(result.status, await safeGeminiErrorDetails(result));
     const payload = await result.json();
     const interaction = payload.interaction || payload;
     return {
@@ -140,8 +170,12 @@ function createApp({ config = loadConfig(), googleAuth = new GoogleAuth(), gemin
     try {
       const result = await geminiCall({ config, googleAuth, message: message.trim(), previousInteractionId: previousInteractionId?.trim() });
       return response.status(200).json(result);
-    } catch {
-      logger?.error?.("[juan-gemini-backend] chat request failed");
+    } catch (error) {
+      if (error instanceof GeminiUpstreamError) {
+        logger?.error?.(`[juan-gemini-backend] Gemini upstream failed (HTTP ${error.status}): ${error.details}`);
+      } else {
+        logger?.error?.("[juan-gemini-backend] chat request failed");
+      }
       return response.status(502).json({ error: "Unable to complete the Gemini request." });
     }
   });
@@ -169,4 +203,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULT_JUAN_MCP_URL, createApp, extractOutputText, getMcpIdToken, loadConfig, callGemini };
+module.exports = { DEFAULT_JUAN_MCP_URL, GeminiUpstreamError, createApp, extractOutputText, getMcpIdToken, loadConfig, callGemini, safeGeminiErrorDetails };
