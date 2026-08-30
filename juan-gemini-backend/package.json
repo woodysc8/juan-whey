@@ -1,0 +1,19 @@
+{
+  "name": "juan-gemini-backend",
+  "version": "1.0.0",
+  "description": "Server-side Gemini Interactions API backend for Juan Whey.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google-cloud/secret-manager": "^7.0.0",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "google-auth-library": "^11.0.2"
+  }
+}
