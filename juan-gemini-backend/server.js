@@ -89,6 +89,10 @@ function redactSensitiveText(value) {
     .replace(/([?&](?:key|api_key)=)[^&\s]+/gi, "$1[REDACTED]");
 }
 
+function safeErrorText(value) {
+  return redactSensitiveText(value).slice(0, 8_000);
+}
+
 function sanitizeUpstreamValue(value) {
   if (Array.isArray(value)) return value.map(sanitizeUpstreamValue);
   if (value && typeof value === "object") {
@@ -174,7 +178,15 @@ function createApp({ config = loadConfig(), googleAuth = new GoogleAuth(), gemin
       if (error instanceof GeminiUpstreamError) {
         logger?.error?.(`[juan-gemini-backend] Gemini upstream failed (HTTP ${error.status}): ${error.details}`);
       } else {
-        logger?.error?.("[juan-gemini-backend] chat request failed");
+        const name = safeErrorText(error?.name || "Error");
+        const message = safeErrorText(error?.message || "Unknown error");
+        logger?.error?.(`[juan-gemini-backend] chat request failed: ${name}: ${message}`);
+        if (error?.stack) logger?.error?.(`[juan-gemini-backend] error stack: ${safeErrorText(error.stack)}`);
+        if (error?.cause) {
+          const causeName = safeErrorText(error.cause.name || "Error");
+          const causeMessage = safeErrorText(error.cause.message || "Unknown error");
+          logger?.error?.(`[juan-gemini-backend] error cause: ${causeName}: ${causeMessage}`);
+        }
       }
       return response.status(502).json({ error: "Unable to complete the Gemini request." });
     }

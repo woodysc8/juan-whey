@@ -64,6 +64,29 @@ test("Gemini upstream failure logs safe status and details without credentials",
   }
 });
 
+test("generic chat errors log safe diagnostics without credentials", async () => {
+  const logs = [];
+  const error = new Error("metadata token failed for Bearer sensitive-mcp-token and AIza12345678901234567890");
+  error.name = "FetchError";
+  error.cause = new Error("socket closed while using Bearer another-sensitive-token");
+  const app = createApp({ config, geminiCall: async () => { throw error; }, logger: { error(message) { logs.push(message); } } });
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "test" }) });
+    assert.equal(response.status, 502);
+    const output = logs.join("\n");
+    assert.match(output, /FetchError: metadata token failed/);
+    assert.match(output, /error stack:/);
+    assert.match(output, /error cause: Error: socket closed/);
+    assert.equal(output.includes("sensitive-mcp-token"), false);
+    assert.equal(output.includes("another-sensitive-token"), false);
+    assert.equal(output.includes("AIza12345678901234567890"), false);
+  } finally {
+    await new Promise((resolve, reject) => server.close((closeError) => closeError ? reject(closeError) : resolve()));
+  }
+});
+
 test("health and chat endpoints validate requests without provider calls", async () => {
   const app = createApp({ config, geminiCall: async ({ message }) => ({ interactionId: "interaction-2", outputText: message, status: "completed", previousInteractionId: "interaction-2" }), logger: { error() {} } });
   const server = http.createServer(app);
