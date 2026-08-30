@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/mcp-http-server.js",
     "mcp": "node src/mcp-server.js",
     "mcp:http": "node src/mcp-http-server.js",
     "test": "node test/run.js && node test/mcp-smoke.js && node test/mcp-http-smoke.js",
