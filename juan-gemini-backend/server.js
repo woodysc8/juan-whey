@@ -131,7 +131,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
       name: "juan_mcp",
       url: config.juanMcpUrl,
       headers: { Authorization: `Bearer ${mcpToken}` },
-      allowed_tools: config.allowedTools,
+      allowed_tools: [{ mode: "auto", tools: config.allowedTools }],
     }],
   };
   if (previousInteractionId) body.previous_interaction_id = previousInteractionId;

@@ -43,7 +43,11 @@ test("Gemini request contains a fresh server-side MCP token and explicit allowli
       assert.equal(options.headers["x-goog-api-key"], config.geminiApiKey);
       assert.equal(body.tools[0].headers.Authorization, "Bearer synthetic-id-token");
       assert.equal(Array.isArray(body.tools[0].allowed_tools), true);
-      assert.deepEqual(body.tools[0].allowed_tools, config.allowedTools);
+      assert.deepEqual(body.tools[0].allowed_tools, [{ mode: "auto", tools: config.allowedTools }]);
+      for (const allowedTool of body.tools[0].allowed_tools) {
+        assert.equal(typeof allowedTool, "object");
+        assert.deepEqual(allowedTool.tools, config.allowedTools);
+      }
       return { ok: true, json: async () => ({ id: "interaction-1", status: "completed", output_text: "Here are options." }) };
     },
   });
