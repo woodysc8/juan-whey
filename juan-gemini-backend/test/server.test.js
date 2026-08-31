@@ -109,7 +109,7 @@ function successfulToolExecutor(callsSeen) {
         type: "function_result",
         call_id: call.callId,
         name: call.name,
-        result: [{ type: "text", text: JSON.stringify({ content: [{ type: "text", text: `result for ${call.name}` }] }) }],
+        result: JSON.stringify({ content: [{ type: "text", text: `result for ${call.name}` }] }),
       }
       : {
         type: "mcp_server_tool_result",
@@ -220,7 +220,7 @@ test("Gemini function_call supplies an MCP result and continues to completion", 
     type: "function_result",
     call_id: "call-1",
     name: "calculate_totals",
-    result: [{ type: "text", text: JSON.stringify({ content: [{ type: "text", text: "result for calculate_totals" }] }) }],
+    result: JSON.stringify({ content: [{ type: "text", text: "result for calculate_totals" }] }),
   });
   assert.equal(result.outputText, "The total is $3.");
 });
@@ -285,7 +285,7 @@ test("MCP tool failures return Gemini function_result error steps", async () => 
       type: "function_result",
       call_id: call.callId,
       name: call.name,
-      result: [{ type: "text", text: JSON.stringify({ error: "Tool execution failed." }) }],
+      result: JSON.stringify({ error: "Tool execution failed." }),
       is_error: true,
     })),
     fetchImpl: async (_url, options) => {
@@ -312,7 +312,7 @@ test("MCP client tool failures become safe result steps without leaking the toke
   });
   assert.equal(result.length, 1);
   assert.equal(result[0].is_error, true);
-  assert.equal(result[0].result[0].text.includes("sensitive-mcp-token"), false);
+  assert.equal(result[0].result.includes("sensitive-mcp-token"), false);
 });
 
 test("non-allowlisted Gemini function calls are not sent to the MCP client", async () => {
@@ -330,7 +330,7 @@ test("non-allowlisted Gemini function calls are not sent to the MCP client", asy
   assert.equal(clientCreated, true, "a client connection may be opened once per action cycle");
   assert.equal(toolCalled, false);
   assert.equal(results[0].is_error, true);
-  assert.match(results[0].result[0].text, /not permitted/);
+  assert.match(results[0].result, /not permitted/);
 });
 
 test("malformed Gemini function calls fail safely before MCP execution", async () => {

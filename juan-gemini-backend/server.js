@@ -184,7 +184,9 @@ function createToolResult(call, result, isError = false) {
       type: "function_result",
       call_id: call.callId,
       name: call.name,
-      result: [{ type: "text", text: resultText(result) }],
+      // Gemini 2.5 accepts the scalar result form. The array-of-content-blocks
+      // form is treated as a multimodal function response and is rejected.
+      result: resultText(result),
       ...(isError ? { is_error: true } : {}),
     };
   }
