@@ -121,8 +121,15 @@ function collectMcpToolCalls(value, calls = []) {
     return calls;
   }
   if (!value || typeof value !== "object") return calls;
-  if (value.type === "mcp_server_tool_call") {
-    calls.push({ serverName: value.server_name ?? value.serverName ?? null, name: value.name ?? null, arguments: value.arguments ?? null });
+  if (value.type === "mcp_server_tool_call" || value.type === "function_call") {
+    calls.push({
+      type: value.type,
+      callId: value.id ?? value.call_id ?? null,
+      serverName: value.server_name ?? value.serverName ?? (value.type === "function_call" ? "juan_mcp" : null),
+      name: value.name ?? null,
+      arguments: value.arguments ?? null,
+    });
+    return calls;
   }
   for (const item of Object.values(value)) collectMcpToolCalls(item, calls);
   return calls;
@@ -136,12 +143,13 @@ function extractMcpToolCalls(interaction) {
       return;
     }
     if (!value || typeof value !== "object") return;
-    if (value.type === "mcp_server_tool_call") {
+    if (value.type === "mcp_server_tool_call" || value.type === "function_call") {
       calls.push({
         callId: value.id ?? value.call_id ?? null,
-        serverName: value.server_name ?? value.serverName ?? null,
+        serverName: value.server_name ?? value.serverName ?? (value.type === "function_call" ? "juan_mcp" : null),
         name: value.name ?? null,
         arguments: value.arguments ?? {},
+        resultType: value.type === "function_call" ? "function_result" : "mcp_server_tool_result",
       });
       return;
     }
@@ -152,28 +160,54 @@ function extractMcpToolCalls(interaction) {
   return calls;
 }
 
-function safeToolFailureResult(call, message) {
+function isWellFormedMcpToolCall(call) {
+  return typeof call.callId === "string"
+    && call.callId.length > 0
+    && typeof call.name === "string"
+    && call.name.length > 0
+    && call.arguments
+    && typeof call.arguments === "object"
+    && !Array.isArray(call.arguments);
+}
+
+function resultText(value) {
+  try {
+    return JSON.stringify(value) ?? "null";
+  } catch {
+    return JSON.stringify({ error: "Juan could not serialize that tool result." });
+  }
+}
+
+function createToolResult(call, result, isError = false) {
+  if (call.resultType === "function_result") {
+    return {
+      type: "function_result",
+      call_id: call.callId,
+      name: call.name,
+      result: [{ type: "text", text: resultText(result) }],
+      ...(isError ? { is_error: true } : {}),
+    };
+  }
   return {
     type: "mcp_server_tool_result",
     call_id: call.callId,
     server_name: call.serverName || "juan_mcp",
     name: call.name || "unknown_tool",
-    result: {
-      content: [{ type: "text", text: message }],
-      isError: true,
-    },
+    result,
   };
 }
 
+function safeToolFailureResult(call, message) {
+  return createToolResult(call, {
+    content: [{ type: "text", text: message }],
+    isError: true,
+  }, true);
+}
+
 function isAllowedMcpToolCall(call, allowedTools) {
-  return typeof call.callId === "string"
-    && call.callId.length > 0
+  return isWellFormedMcpToolCall(call)
     && call.serverName === "juan_mcp"
-    && typeof call.name === "string"
-    && allowedTools.includes(call.name)
-    && call.arguments
-    && typeof call.arguments === "object"
-    && !Array.isArray(call.arguments);
+    && allowedTools.includes(call.name);
 }
 
 async function createMcpToolClient({ url, token }) {
@@ -206,13 +240,7 @@ async function executeMcpToolCalls({ config, mcpToken, calls, createClient = cre
       }
       try {
         const result = await client.callTool({ name: call.name, arguments: call.arguments });
-        results.push({
-          type: "mcp_server_tool_result",
-          call_id: call.callId,
-          server_name: call.serverName,
-          name: call.name,
-          result,
-        });
+        results.push(createToolResult(call, result));
       } catch {
         results.push(safeToolFailureResult(call, "Juan could not complete that travel research tool call."));
       }
@@ -226,13 +254,13 @@ async function executeMcpToolCalls({ config, mcpToken, calls, createClient = cre
 function logRequiresActionDiagnostics(interaction, logger) {
   if (interaction?.status !== "requires_action") return;
   const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
-  const requiresActionSteps = steps.filter((step) => step?.type === "requires_action");
+  const actionSteps = steps.filter((step) => step?.type === "requires_action" || step?.type === "function_call" || step?.type === "mcp_server_tool_call");
   const diagnostic = sanitizeUpstreamValue({
     interactionId: interaction.id || null,
     interactionStatus: interaction.status,
     stepTypes: steps.map((step) => step?.type || null),
-    requiresActionSteps,
-    mcpToolCalls: collectMcpToolCalls(requiresActionSteps),
+    actionSteps,
+    mcpToolCalls: collectMcpToolCalls(actionSteps),
   });
   logger?.info?.(`[juan-gemini-backend] Gemini interaction requires action: ${JSON.stringify(diagnostic)}`);
 }
@@ -306,6 +334,9 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
       const calls = extractMcpToolCalls(interaction);
       if (!calls.length) {
         throw new GeminiToolLoopError("Gemini requested an unsupported action instead of a Juan MCP tool call.");
+      }
+      if (!calls.every(isWellFormedMcpToolCall)) {
+        throw new GeminiToolLoopError("Gemini supplied a malformed MCP function call.");
       }
       actionCycles += 1;
       const results = await mcpToolExecutor({ config, mcpToken, calls });
@@ -399,11 +430,13 @@ module.exports = {
   callGemini,
   createApp,
   createGeminiRequestBody,
+  createToolResult,
   createMcpToolClient,
   executeMcpToolCalls,
   extractMcpToolCalls,
   extractOutputText,
   getMcpIdToken,
   loadConfig,
+  isAllowedMcpToolCall,
   safeGeminiErrorDetails,
 };

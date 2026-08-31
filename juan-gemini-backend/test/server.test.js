@@ -93,6 +93,10 @@ function mcpCall(id, name = "calculate_totals", argumentsValue = { numbers: [1, 
   return { type: "mcp_server_tool_call", id, server_name: "juan_mcp", name, arguments: argumentsValue };
 }
 
+function functionCall(id, name = "calculate_totals", argumentsValue = { numbers: [1, 2] }) {
+  return { type: "function_call", id, name, arguments: argumentsValue };
+}
+
 function mockGoogleAuth() {
   return { getIdTokenClient: async () => ({ getRequestHeaders: async () => ({ Authorization: "Bearer synthetic-id-token" }) }) };
 }
@@ -100,13 +104,20 @@ function mockGoogleAuth() {
 function successfulToolExecutor(callsSeen) {
   return async ({ calls }) => {
     callsSeen.push(...calls);
-    return calls.map((call) => ({
-      type: "mcp_server_tool_result",
-      call_id: call.callId,
-      server_name: call.serverName,
-      name: call.name,
-      result: { content: [{ type: "text", text: `result for ${call.name}` }] },
-    }));
+    return calls.map((call) => call.resultType === "function_result"
+      ? {
+        type: "function_result",
+        call_id: call.callId,
+        name: call.name,
+        result: [{ type: "text", text: JSON.stringify({ content: [{ type: "text", text: `result for ${call.name}` }] }) }],
+      }
+      : {
+        type: "mcp_server_tool_result",
+        call_id: call.callId,
+        server_name: call.serverName,
+        name: call.name,
+        result: { content: [{ type: "text", text: `result for ${call.name}` }] },
+      });
   };
 }
 
@@ -185,11 +196,11 @@ test("Gemini completes normally without MCP tool execution", async () => {
   assert.equal(result.outputText, "Hello señor.");
 });
 
-test("one MCP tool call supplies a result and continues to completion", async () => {
+test("Gemini function_call supplies an MCP result and continues to completion", async () => {
   const callsSeen = [];
   const requests = [];
   const responses = [
-    requiresActionInteraction("interaction-1", [mcpCall("call-1")]),
+    { id: "interaction-1", status: "requires_action", steps: [{ type: "thought", content: [] }, functionCall("call-1")] },
     completedInteraction("interaction-2", "The total is $3."),
   ];
   const result = await callGemini({
@@ -206,20 +217,19 @@ test("one MCP tool call supplies a result and continues to completion", async ()
   assert.equal(requests.length, 2);
   assert.equal(requests[1].previous_interaction_id, "interaction-1");
   assert.deepEqual(requests[1].input[0], {
-    type: "mcp_server_tool_result",
+    type: "function_result",
     call_id: "call-1",
-    server_name: "juan_mcp",
     name: "calculate_totals",
-    result: { content: [{ type: "text", text: "result for calculate_totals" }] },
+    result: [{ type: "text", text: JSON.stringify({ content: [{ type: "text", text: "result for calculate_totals" }] }) }],
   });
   assert.equal(result.outputText, "The total is $3.");
 });
 
-test("multiple MCP tool calls are executed before Gemini continuation", async () => {
+test("multiple Gemini function_call steps are executed before continuation", async () => {
   const callsSeen = [];
   const requests = [];
   const responses = [
-    requiresActionInteraction("interaction-multi", [mcpCall("call-1"), mcpCall("call-2", "get_trip_intent", {})]),
+    { id: "interaction-multi", status: "requires_action", steps: [functionCall("call-1"), functionCall("call-2", "get_trip_intent", {})] },
     completedInteraction("interaction-multi-finished"),
   ];
   await callGemini({
@@ -237,12 +247,12 @@ test("multiple MCP tool calls are executed before Gemini continuation", async ()
   assert.deepEqual(requests[1].input.map((item) => item.call_id), ["call-1", "call-2"]);
 });
 
-test("Gemini follows a second requires_action with another MCP continuation", async () => {
+test("Gemini follows a function_call action cycle with another MCP continuation", async () => {
   const callsSeen = [];
   const requests = [];
   const responses = [
-    requiresActionInteraction("interaction-first", [mcpCall("call-first")]),
-    requiresActionInteraction("interaction-second", [mcpCall("call-second", "get_trip_intent", {})]),
+    { id: "interaction-first", status: "requires_action", steps: [functionCall("call-first")] },
+    { id: "interaction-second", status: "requires_action", steps: [functionCall("call-second", "get_trip_intent", {})] },
     completedInteraction("interaction-final", "Finished researching."),
   ];
   const result = await callGemini({
@@ -261,10 +271,10 @@ test("Gemini follows a second requires_action with another MCP continuation", as
   assert.equal(result.status, "completed");
 });
 
-test("MCP tool failures are returned to Gemini as safe tool results", async () => {
+test("MCP tool failures return Gemini function_result error steps", async () => {
   const requests = [];
   const responses = [
-    requiresActionInteraction("interaction-failed-tool", [mcpCall("call-failed")]),
+    { id: "interaction-failed-tool", status: "requires_action", steps: [functionCall("call-failed")] },
     completedInteraction("interaction-recovered", "That search failed, so I need another option."),
   ];
   const result = await callGemini({
@@ -272,18 +282,18 @@ test("MCP tool failures are returned to Gemini as safe tool results", async () =
     googleAuth: mockGoogleAuth(),
     message: "Research",
     mcpToolExecutor: async ({ calls }) => calls.map((call) => ({
-      type: "mcp_server_tool_result",
+      type: "function_result",
       call_id: call.callId,
-      server_name: call.serverName,
       name: call.name,
-      result: { content: [{ type: "text", text: "Tool execution failed." }], isError: true },
+      result: [{ type: "text", text: JSON.stringify({ error: "Tool execution failed." }) }],
+      is_error: true,
     })),
     fetchImpl: async (_url, options) => {
       requests.push(JSON.parse(options.body));
       return { ok: true, json: async () => responses.shift() };
     },
   });
-  assert.equal(requests[1].input[0].result.isError, true);
+  assert.equal(requests[1].input[0].is_error, true);
   assert.equal(result.status, "completed");
 });
 
@@ -291,7 +301,7 @@ test("MCP client tool failures become safe result steps without leaking the toke
   const result = await executeMcpToolCalls({
     config,
     mcpToken: "sensitive-mcp-token",
-    calls: [{ callId: "call-failed-client", serverName: "juan_mcp", name: "calculate_totals", arguments: { numbers: [1, 2] } }],
+    calls: [{ callId: "call-failed-client", serverName: "juan_mcp", name: "calculate_totals", arguments: { numbers: [1, 2] }, resultType: "function_result" }],
     createClient: async ({ token }) => {
       assert.equal(token, "sensitive-mcp-token");
       return {
@@ -301,8 +311,41 @@ test("MCP client tool failures become safe result steps without leaking the toke
     },
   });
   assert.equal(result.length, 1);
-  assert.equal(result[0].result.isError, true);
-  assert.equal(result[0].result.content[0].text.includes("sensitive-mcp-token"), false);
+  assert.equal(result[0].is_error, true);
+  assert.equal(result[0].result[0].text.includes("sensitive-mcp-token"), false);
+});
+
+test("non-allowlisted Gemini function calls are not sent to the MCP client", async () => {
+  let clientCreated = false;
+  let toolCalled = false;
+  const results = await executeMcpToolCalls({
+    config,
+    mcpToken: "synthetic-id-token",
+    calls: [{ callId: "call-not-allowed", serverName: "juan_mcp", name: "delete_everything", arguments: {}, resultType: "function_result" }],
+    createClient: async () => {
+      clientCreated = true;
+      return { callTool: async () => { toolCalled = true; }, close: async () => {} };
+    },
+  });
+  assert.equal(clientCreated, true, "a client connection may be opened once per action cycle");
+  assert.equal(toolCalled, false);
+  assert.equal(results[0].is_error, true);
+  assert.match(results[0].result[0].text, /not permitted/);
+});
+
+test("malformed Gemini function calls fail safely before MCP execution", async () => {
+  let executorCalled = false;
+  await assert.rejects(() => callGemini({
+    config,
+    googleAuth: mockGoogleAuth(),
+    message: "Bad call",
+    mcpToolExecutor: async () => { executorCalled = true; return []; },
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ id: "interaction-malformed", status: "requires_action", steps: [{ type: "function_call", id: "", name: "calculate_totals", arguments: [] }] }),
+    }),
+  }), /malformed MCP function call/);
+  assert.equal(executorCalled, false);
 });
 
 test("MCP action cycles are bounded", async () => {
@@ -315,7 +358,7 @@ test("MCP action cycles are bounded", async () => {
     mcpToolExecutor: successfulToolExecutor([]),
     fetchImpl: async () => ({
       ok: true,
-      json: async () => requiresActionInteraction(`interaction-${++requestCount}`, [mcpCall(`call-${requestCount}`)]),
+      json: async () => ({ id: `interaction-${++requestCount}`, status: "requires_action", steps: [functionCall(`call-${requestCount}`)] }),
     }),
   }), /maximum number of travel research action cycles/);
   assert.equal(requestCount, 3, "the limit is checked before executing an additional cycle");
