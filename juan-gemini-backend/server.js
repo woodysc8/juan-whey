@@ -127,7 +127,6 @@ function collectMcpToolCalls(value, calls = []) {
       callId: value.id ?? value.call_id ?? null,
       serverName: value.server_name ?? value.serverName ?? (value.type === "function_call" ? "juan_mcp" : null),
       name: value.name ?? null,
-      arguments: value.arguments ?? null,
     });
     return calls;
   }
@@ -261,7 +260,7 @@ function logRequiresActionDiagnostics(interaction, logger) {
     interactionId: interaction.id || null,
     interactionStatus: interaction.status,
     stepTypes: steps.map((step) => step?.type || null),
-    actionSteps,
+    actionStepTypes: actionSteps.map((step) => step?.type || null),
     mcpToolCalls: collectMcpToolCalls(actionSteps),
   });
   logger?.info?.(`[juan-gemini-backend] Gemini interaction requires action: ${JSON.stringify(diagnostic)}`);
@@ -269,16 +268,28 @@ function logRequiresActionDiagnostics(interaction, logger) {
 
 function logCompletedWithoutOutputDiagnostics(interaction, outputText, logger) {
   if (interaction?.status !== "completed" || outputText !== null) return;
-  const steps = Array.isArray(interaction.steps) ? interaction.steps : null;
-  const diagnostic = sanitizeUpstreamValue({
+  const usage = interaction.usage || {};
+  const diagnostic = {
     interactionId: interaction.id || null,
     interactionStatus: interaction.status,
-    topLevelKeys: Object.keys(interaction),
-    stepTypes: steps ? steps.map((step) => step?.type || null) : null,
-    steps,
-    interaction,
-  });
+    totalOutputTokens: Number.isFinite(usage.total_output_tokens) ? usage.total_output_tokens : null,
+    totalToolUseTokens: Number.isFinite(usage.total_tool_use_tokens) ? usage.total_tool_use_tokens : null,
+    totalThoughtTokens: Number.isFinite(usage.total_thought_tokens) ? usage.total_thought_tokens : null,
+  };
   logger?.info?.(`[juan-gemini-backend] Gemini interaction completed without extracted output: ${JSON.stringify(diagnostic)}`);
+}
+
+function logGeminiRequestMetadata({ config, input, previousInteractionId, logger }) {
+  const inputPresent = typeof input === "string" ? input.length > 0 : Array.isArray(input) ? input.length > 0 : input != null;
+  const metadata = sanitizeUpstreamValue({
+    model: config.model,
+    inputPresent,
+    inputType: Array.isArray(input) ? "array" : typeof input,
+    configuredToolCount: config.allowedTools.length,
+    configuredToolNames: config.allowedTools,
+    previousInteractionIdPresent: Boolean(previousInteractionId),
+  });
+  logger?.info?.(`[juan-gemini-backend] Gemini request metadata: ${JSON.stringify(metadata)}`);
 }
 
 async function safeGeminiErrorDetails(result) {
@@ -318,8 +329,9 @@ function createGeminiRequestBody({ config, mcpToken, input, previousInteractionI
   return body;
 }
 
-async function postGeminiInteraction({ config, mcpToken, input, previousInteractionId, fetchImpl, signal }) {
+async function postGeminiInteraction({ config, mcpToken, input, previousInteractionId, fetchImpl, signal, logger }) {
   const body = createGeminiRequestBody({ config, mcpToken, input, previousInteractionId });
+  logGeminiRequestMetadata({ config, input, previousInteractionId, logger });
   const result = await fetchImpl(GEMINI_INTERACTIONS_URL, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": config.geminiApiKey },
@@ -338,7 +350,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
   const timer = setTimeout(() => abort.abort(), 60_000);
   try {
     let interaction = await postGeminiInteraction({
-      config, mcpToken, input: message, previousInteractionId, fetchImpl, signal: abort.signal,
+      config, mcpToken, input: message, previousInteractionId, fetchImpl, signal: abort.signal, logger,
     });
     let actionCycles = 0;
 
@@ -366,6 +378,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
         previousInteractionId: interaction.id || previousInteractionId,
         fetchImpl,
         signal: abort.signal,
+        logger,
       });
     }
     const outputText = extractOutputText(interaction || {});
@@ -457,5 +470,6 @@ module.exports = {
   loadConfig,
   isAllowedMcpToolCall,
   logCompletedWithoutOutputDiagnostics,
+  logGeminiRequestMetadata,
   safeGeminiErrorDetails,
 };

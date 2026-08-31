@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const test = require("node:test");
-const { MAX_MCP_ACTION_CYCLES, callGemini, createApp, executeMcpToolCalls, getMcpIdToken, loadConfig, logCompletedWithoutOutputDiagnostics } = require("../server.js");
+const { MAX_MCP_ACTION_CYCLES, callGemini, createApp, executeMcpToolCalls, getMcpIdToken, loadConfig, logCompletedWithoutOutputDiagnostics, logGeminiRequestMetadata } = require("../server.js");
 const { JUAN_TRAVELER_PROFILE, buildJuanSystemInstruction } = require("../travelerProfile.js");
 
 const config = {
@@ -121,7 +121,7 @@ function successfulToolExecutor(callsSeen) {
   };
 }
 
-test("requires_action diagnostics retain MCP call context without credentials", async () => {
+test("requires_action diagnostics retain MCP tool identifiers without arguments or credentials", async () => {
   const logs = [];
   const callsSeen = [];
   const googleAuth = mockGoogleAuth();
@@ -175,8 +175,7 @@ test("requires_action diagnostics retain MCP call context without credentials", 
   assert.match(output, /requires_action/);
   assert.match(output, /model_output/);
   assert.match(output, /search_airports/);
-  assert.match(output, /Miami/);
-  assert.match(output, /\[REDACTED\]/);
+  assert.equal(output.includes("Miami"), false);
   assert.equal(output.includes("sensitive-mcp-token"), false);
   assert.equal(output.includes("another-sensitive-token"), false);
   assert.equal(output.includes("AIza12345678901234567890"), false);
@@ -196,18 +195,40 @@ test("Gemini completes normally without MCP tool execution", async () => {
   assert.equal(result.outputText, "Hello señor.");
 });
 
-test("completed interaction diagnostics capture an unrecognized output shape without secrets", () => {
+test("Gemini request metadata omits input and sensitive values", () => {
+  const logs = [];
+  logGeminiRequestMetadata({
+    config: { ...config, allowedTools: ["calculate_totals", "Bearer sensitive-mcp-token"] },
+    input: "private user request with AIza12345678901234567890",
+    previousInteractionId: "previous-interaction",
+    logger: { info(message) { logs.push(message); } },
+  });
+  const output = logs.join("\n");
+  assert.match(output, /Gemini request metadata/);
+  assert.match(output, /gemini-test-model/);
+  assert.match(output, /"inputPresent":true/);
+  assert.match(output, /"inputType":"string"/);
+  assert.match(output, /"configuredToolCount":2/);
+  assert.match(output, /calculate_totals/);
+  assert.match(output, /"previousInteractionIdPresent":true/);
+  assert.equal(output.includes("private user request"), false);
+  assert.equal(output.includes("sensitive-mcp-token"), false);
+  assert.equal(output.includes("AIza12345678901234567890"), false);
+});
+
+test("completed-null-output diagnostics log usage counts without raw interaction data", () => {
   const logs = [];
   const interaction = {
     id: "interaction-unrecognized-output",
     status: "completed",
-    alternate_output: { text: "Unexpected output location" },
-    steps: [{
-      type: "unexpected_model_output",
-      payload: { text: "Unexpected output location" },
-      authorization: "Bearer sensitive-mcp-token",
-      apiKey: "AIza12345678901234567890",
-    }],
+    usage: {
+      total_output_tokens: 0,
+      total_tool_use_tokens: 321,
+      total_thought_tokens: 89,
+    },
+    authorization: "Bearer sensitive-mcp-token",
+    apiKey: "AIza12345678901234567890",
+    steps: [{ type: "unexpected_model_output", payload: { text: "must-not-log" } }],
   };
 
   logCompletedWithoutOutputDiagnostics(interaction, null, { info(message) { logs.push(message); } });
@@ -215,11 +236,13 @@ test("completed interaction diagnostics capture an unrecognized output shape wit
   const output = logs.join("\n");
   assert.match(output, /completed without extracted output/);
   assert.match(output, /interaction-unrecognized-output/);
-  assert.match(output, /unexpected_model_output/);
-  assert.match(output, /alternate_output/);
-  assert.match(output, /\[REDACTED\]/);
+  assert.match(output, /"totalOutputTokens":0/);
+  assert.match(output, /"totalToolUseTokens":321/);
+  assert.match(output, /"totalThoughtTokens":89/);
   assert.equal(output.includes("sensitive-mcp-token"), false);
   assert.equal(output.includes("AIza12345678901234567890"), false);
+  assert.equal(output.includes("unexpected_model_output"), false);
+  assert.equal(output.includes("must-not-log"), false);
 });
 
 test("Gemini function_call supplies an MCP result and continues to completion", async () => {
