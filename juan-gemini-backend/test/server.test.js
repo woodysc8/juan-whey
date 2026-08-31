@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const test = require("node:test");
-const { MAX_MCP_ACTION_CYCLES, callGemini, createApp, executeMcpToolCalls, getMcpIdToken, loadConfig } = require("../server.js");
+const { MAX_MCP_ACTION_CYCLES, callGemini, createApp, executeMcpToolCalls, getMcpIdToken, loadConfig, logCompletedWithoutOutputDiagnostics } = require("../server.js");
 const { JUAN_TRAVELER_PROFILE, buildJuanSystemInstruction } = require("../travelerProfile.js");
 
 const config = {
@@ -194,6 +194,32 @@ test("Gemini completes normally without MCP tool execution", async () => {
   assert.equal(executorCalled, false);
   assert.equal(result.status, "completed");
   assert.equal(result.outputText, "Hello señor.");
+});
+
+test("completed interaction diagnostics capture an unrecognized output shape without secrets", () => {
+  const logs = [];
+  const interaction = {
+    id: "interaction-unrecognized-output",
+    status: "completed",
+    alternate_output: { text: "Unexpected output location" },
+    steps: [{
+      type: "unexpected_model_output",
+      payload: { text: "Unexpected output location" },
+      authorization: "Bearer sensitive-mcp-token",
+      apiKey: "AIza12345678901234567890",
+    }],
+  };
+
+  logCompletedWithoutOutputDiagnostics(interaction, null, { info(message) { logs.push(message); } });
+
+  const output = logs.join("\n");
+  assert.match(output, /completed without extracted output/);
+  assert.match(output, /interaction-unrecognized-output/);
+  assert.match(output, /unexpected_model_output/);
+  assert.match(output, /alternate_output/);
+  assert.match(output, /\[REDACTED\]/);
+  assert.equal(output.includes("sensitive-mcp-token"), false);
+  assert.equal(output.includes("AIza12345678901234567890"), false);
 });
 
 test("Gemini function_call supplies an MCP result and continues to completion", async () => {

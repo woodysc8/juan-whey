@@ -267,6 +267,20 @@ function logRequiresActionDiagnostics(interaction, logger) {
   logger?.info?.(`[juan-gemini-backend] Gemini interaction requires action: ${JSON.stringify(diagnostic)}`);
 }
 
+function logCompletedWithoutOutputDiagnostics(interaction, outputText, logger) {
+  if (interaction?.status !== "completed" || outputText !== null) return;
+  const steps = Array.isArray(interaction.steps) ? interaction.steps : null;
+  const diagnostic = sanitizeUpstreamValue({
+    interactionId: interaction.id || null,
+    interactionStatus: interaction.status,
+    topLevelKeys: Object.keys(interaction),
+    stepTypes: steps ? steps.map((step) => step?.type || null) : null,
+    steps,
+    interaction,
+  });
+  logger?.info?.(`[juan-gemini-backend] Gemini interaction completed without extracted output: ${JSON.stringify(diagnostic)}`);
+}
+
 async function safeGeminiErrorDetails(result) {
   const text = (await result.text()).slice(0, 4_000);
   if (!text) return "No response body.";
@@ -354,9 +368,11 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
         signal: abort.signal,
       });
     }
+    const outputText = extractOutputText(interaction || {});
+    logCompletedWithoutOutputDiagnostics(interaction, outputText, logger);
     return {
       interactionId: interaction?.id || null,
-      outputText: extractOutputText(interaction || {}),
+      outputText,
       status: interaction?.status || null,
       previousInteractionId: interaction?.id || previousInteractionId || null,
     };
@@ -440,5 +456,6 @@ module.exports = {
   getMcpIdToken,
   loadConfig,
   isAllowedMcpToolCall,
+  logCompletedWithoutOutputDiagnostics,
   safeGeminiErrorDetails,
 };
