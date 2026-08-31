@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const http = require("node:http");
 const test = require("node:test");
 const { callGemini, createApp, getMcpIdToken, loadConfig } = require("../server.js");
+const { JUAN_TRAVELER_PROFILE, buildJuanSystemInstruction } = require("../travelerProfile.js");
 
 const config = {
   geminiApiKey: "test-key-not-a-real-secret",
@@ -41,6 +42,8 @@ test("Gemini request contains a fresh server-side MCP token and explicit allowli
     fetchImpl: async (_url, options) => {
       const body = JSON.parse(options.body);
       assert.equal(options.headers["x-goog-api-key"], config.geminiApiKey);
+      assert.match(body.system_instruction, /"name":"Sam"/);
+      assert.match(body.system_instruction, /Address Sam as señor/);
       assert.equal(body.tools[0].headers.Authorization, "Bearer synthetic-id-token");
       assert.equal(Array.isArray(body.tools[0].allowed_tools), true);
       assert.deepEqual(body.tools[0].allowed_tools, [{ mode: "auto", tools: config.allowedTools }]);
@@ -52,6 +55,72 @@ test("Gemini request contains a fresh server-side MCP token and explicit allowli
     },
   });
   assert.deepEqual(result, { interactionId: "interaction-1", outputText: "Here are options.", status: "completed", previousInteractionId: "interaction-1" });
+});
+
+test("traveler profile is compact, avoids profile MCP calls, and defines research boundaries", () => {
+  const instruction = buildJuanSystemInstruction();
+  assert.equal(JUAN_TRAVELER_PROFILE.departure_airports.preferred[0], "BOS");
+  assert.deepEqual(JUAN_TRAVELER_PROFILE.departure_airports.acceptable, ["PVD", "BDL", "NYC"]);
+  assert.equal(JUAN_TRAVELER_PROFILE.rewards.bilt_member, true);
+  assert.equal("dates" in JUAN_TRAVELER_PROFILE, false);
+  assert.equal("destination" in JUAN_TRAVELER_PROFILE, false);
+  assert.equal("current_prices" in JUAN_TRAVELER_PROFILE, false);
+  assert.ok(Buffer.byteLength(instruction, "utf8") < 3_000, "profile context stays compact per interaction");
+  assert.equal(instruction.includes("get_traveler_profile"), false, "stable facts are injected, not retrieved through MCP");
+  assert.match(instruction, /Explicit trip instructions override profile defaults/);
+  assert.match(instruction, /current external research/);
+  assert.match(instruction, /proactively research a small set of promising destinations/);
+  assert.match(instruction, /not current facts/);
+  assert.doesNotMatch(JSON.stringify(JUAN_TRAVELER_PROFILE), /amadeus/i);
+});
+
+test("requires_action diagnostics retain MCP call context without credentials", async () => {
+  const logs = [];
+  const googleAuth = { getIdTokenClient: async () => ({ getRequestHeaders: async () => ({ Authorization: "Bearer synthetic-id-token" }) }) };
+  const result = await callGemini({
+    config,
+    googleAuth,
+    message: "Find a flight",
+    logger: { info(message) { logs.push(message); } },
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({
+        id: "interaction-requires-action",
+        status: "requires_action",
+        steps: [
+          { type: "model_output", content: [] },
+          {
+            type: "requires_action",
+            required_action: {
+              type: "tool_calls",
+              tool_calls: [{
+                type: "mcp_server_tool_call",
+                server_name: "juan_mcp",
+                name: "search_airports",
+                arguments: {
+                  keyword: "Miami",
+                  authorization: "Bearer sensitive-mcp-token",
+                  apiKey: "AIza12345678901234567890",
+                  mcpBearer: "another-sensitive-token",
+                },
+              }],
+            },
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(result.status, "requires_action");
+  const output = logs.join("\n");
+  assert.match(output, /interaction-requires-action/);
+  assert.match(output, /requires_action/);
+  assert.match(output, /model_output/);
+  assert.match(output, /search_airports/);
+  assert.match(output, /Miami/);
+  assert.match(output, /\[REDACTED\]/);
+  assert.equal(output.includes("sensitive-mcp-token"), false);
+  assert.equal(output.includes("another-sensitive-token"), false);
+  assert.equal(output.includes("AIza12345678901234567890"), false);
 });
 
 test("Gemini upstream failure logs safe status and details without credentials", async () => {

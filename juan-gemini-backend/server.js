@@ -4,6 +4,7 @@ require("dotenv/config");
 
 const express = require("express");
 const { GoogleAuth } = require("google-auth-library");
+const { JUAN_SYSTEM_INSTRUCTION } = require("./travelerProfile");
 
 const DEFAULT_JUAN_MCP_URL = "https://juan-whey.onrender.com/mcp";
 const DEFAULT_PORT = 8080;
@@ -93,12 +94,44 @@ function safeErrorText(value) {
   return redactSensitiveText(value).slice(0, 8_000);
 }
 
+function isSensitiveFieldName(key) {
+  const normalized = String(key).replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return normalized === "key" || normalized === "apikey" || normalized.includes("authorization") || normalized.includes("token") || normalized.includes("secret") || normalized.includes("credential") || normalized.includes("bearer") || normalized.includes("password") || normalized.includes("cookie") || normalized.includes("privatekey");
+}
+
 function sanitizeUpstreamValue(value) {
   if (Array.isArray(value)) return value.map(sanitizeUpstreamValue);
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /authorization|token|key|secret|credential/i.test(key) ? "[REDACTED]" : sanitizeUpstreamValue(item)]));
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, isSensitiveFieldName(key) ? "[REDACTED]" : sanitizeUpstreamValue(item)]));
   }
   return typeof value === "string" ? redactSensitiveText(value) : value;
+}
+
+function collectMcpToolCalls(value, calls = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectMcpToolCalls(item, calls);
+    return calls;
+  }
+  if (!value || typeof value !== "object") return calls;
+  if (value.type === "mcp_server_tool_call") {
+    calls.push({ serverName: value.server_name ?? value.serverName ?? null, name: value.name ?? null, arguments: value.arguments ?? null });
+  }
+  for (const item of Object.values(value)) collectMcpToolCalls(item, calls);
+  return calls;
+}
+
+function logRequiresActionDiagnostics(interaction, logger) {
+  if (interaction?.status !== "requires_action") return;
+  const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
+  const requiresActionSteps = steps.filter((step) => step?.type === "requires_action");
+  const diagnostic = sanitizeUpstreamValue({
+    interactionId: interaction.id || null,
+    interactionStatus: interaction.status,
+    stepTypes: steps.map((step) => step?.type || null),
+    requiresActionSteps,
+    mcpToolCalls: collectMcpToolCalls(requiresActionSteps),
+  });
+  logger?.info?.(`[juan-gemini-backend] Gemini interaction requires action: ${JSON.stringify(diagnostic)}`);
 }
 
 async function safeGeminiErrorDetails(result) {
@@ -121,11 +154,12 @@ async function getMcpIdToken(googleAuth, audience) {
   return authorization.slice("Bearer ".length);
 }
 
-async function callGemini({ config, googleAuth, message, previousInteractionId, fetchImpl = fetch }) {
+async function callGemini({ config, googleAuth, message, previousInteractionId, fetchImpl = fetch, logger = console }) {
   const mcpToken = await getMcpIdToken(googleAuth, config.juanMcpAudience);
   const body = {
     model: config.model,
     input: message,
+    system_instruction: JUAN_SYSTEM_INSTRUCTION,
     tools: [{
       type: "mcp_server",
       name: "juan_mcp",
@@ -148,6 +182,7 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
     if (!result.ok) throw new GeminiUpstreamError(result.status, await safeGeminiErrorDetails(result));
     const payload = await result.json();
     const interaction = payload.interaction || payload;
+    logRequiresActionDiagnostics(interaction, logger);
     return {
       interactionId: interaction.id || null,
       outputText: extractOutputText(interaction),
@@ -175,7 +210,7 @@ function createApp({ config = loadConfig(), googleAuth = new GoogleAuth(), gemin
       return response.status(400).json({ error: "previousInteractionId must be a non-empty string when supplied." });
     }
     try {
-      const result = await geminiCall({ config, googleAuth, message: message.trim(), previousInteractionId: previousInteractionId?.trim() });
+      const result = await geminiCall({ config, googleAuth, message: message.trim(), previousInteractionId: previousInteractionId?.trim(), logger });
       return response.status(200).json(result);
     } catch (error) {
       if (error instanceof GeminiUpstreamError) {
