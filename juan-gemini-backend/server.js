@@ -10,6 +10,7 @@ const DEFAULT_JUAN_MCP_URL = "https://juan-whey.onrender.com/mcp";
 const DEFAULT_PORT = 8080;
 const MAX_MESSAGE_LENGTH = 12_000;
 const MAX_REQUEST_BYTES = "32kb";
+const MAX_MCP_ACTION_CYCLES = 4;
 const GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
 class GeminiUpstreamError extends Error {
@@ -17,6 +18,13 @@ class GeminiUpstreamError extends Error {
     super(`Gemini request failed with HTTP ${status}.`);
     this.status = status;
     this.details = details;
+  }
+}
+
+class GeminiToolLoopError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GeminiToolLoopError";
   }
 }
 
@@ -120,6 +128,101 @@ function collectMcpToolCalls(value, calls = []) {
   return calls;
 }
 
+function extractMcpToolCalls(interaction) {
+  const calls = [];
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (value.type === "mcp_server_tool_call") {
+      calls.push({
+        callId: value.id ?? value.call_id ?? null,
+        serverName: value.server_name ?? value.serverName ?? null,
+        name: value.name ?? null,
+        arguments: value.arguments ?? {},
+      });
+      return;
+    }
+    for (const item of Object.values(value)) visit(item);
+  };
+
+  for (const step of Array.isArray(interaction?.steps) ? interaction.steps : []) visit(step);
+  return calls;
+}
+
+function safeToolFailureResult(call, message) {
+  return {
+    type: "mcp_server_tool_result",
+    call_id: call.callId,
+    server_name: call.serverName || "juan_mcp",
+    name: call.name || "unknown_tool",
+    result: {
+      content: [{ type: "text", text: message }],
+      isError: true,
+    },
+  };
+}
+
+function isAllowedMcpToolCall(call, allowedTools) {
+  return typeof call.callId === "string"
+    && call.callId.length > 0
+    && call.serverName === "juan_mcp"
+    && typeof call.name === "string"
+    && allowedTools.includes(call.name)
+    && call.arguments
+    && typeof call.arguments === "object"
+    && !Array.isArray(call.arguments);
+}
+
+async function createMcpToolClient({ url, token }) {
+  // The backend is CommonJS while the MCP SDK is ESM-first; its supported CJS
+  // exports keep the transport implementation behind this narrow adapter.
+  const { Client } = require("@modelcontextprotocol/sdk/client");
+  const { StreamableHTTPClientTransport } = require("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const client = new Client({ name: "juan-gemini-backend", version: "1.0.0" }, { capabilities: {} });
+  const transport = new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
+  });
+  await client.connect(transport);
+  return client;
+}
+
+async function executeMcpToolCalls({ config, mcpToken, calls, createClient = createMcpToolClient }) {
+  let client;
+  const results = [];
+  try {
+    client = await createClient({ url: config.juanMcpUrl, token: mcpToken });
+  } catch {
+    return calls.map((call) => safeToolFailureResult(call, "Juan could not reach the travel research service."));
+  }
+
+  try {
+    for (const call of calls) {
+      if (!isAllowedMcpToolCall(call, config.allowedTools)) {
+        results.push(safeToolFailureResult(call, "This MCP tool request is not permitted."));
+        continue;
+      }
+      try {
+        const result = await client.callTool({ name: call.name, arguments: call.arguments });
+        results.push({
+          type: "mcp_server_tool_result",
+          call_id: call.callId,
+          server_name: call.serverName,
+          name: call.name,
+          result,
+        });
+      } catch {
+        results.push(safeToolFailureResult(call, "Juan could not complete that travel research tool call."));
+      }
+    }
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return results;
+}
+
 function logRequiresActionDiagnostics(interaction, logger) {
   if (interaction?.status !== "requires_action") return;
   const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
@@ -154,11 +257,10 @@ async function getMcpIdToken(googleAuth, audience) {
   return authorization.slice("Bearer ".length);
 }
 
-async function callGemini({ config, googleAuth, message, previousInteractionId, fetchImpl = fetch, logger = console }) {
-  const mcpToken = await getMcpIdToken(googleAuth, config.juanMcpAudience);
+function createGeminiRequestBody({ config, mcpToken, input, previousInteractionId }) {
   const body = {
     model: config.model,
-    input: message,
+    input,
     system_instruction: JUAN_SYSTEM_INSTRUCTION,
     tools: [{
       type: "mcp_server",
@@ -169,25 +271,61 @@ async function callGemini({ config, googleAuth, message, previousInteractionId, 
     }],
   };
   if (previousInteractionId) body.previous_interaction_id = previousInteractionId;
+  return body;
+}
+
+async function postGeminiInteraction({ config, mcpToken, input, previousInteractionId, fetchImpl, signal }) {
+  const body = createGeminiRequestBody({ config, mcpToken, input, previousInteractionId });
+  const result = await fetchImpl(GEMINI_INTERACTIONS_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": config.geminiApiKey },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!result.ok) throw new GeminiUpstreamError(result.status, await safeGeminiErrorDetails(result));
+  const payload = await result.json();
+  return payload.interaction || payload;
+}
+
+async function callGemini({ config, googleAuth, message, previousInteractionId, fetchImpl = fetch, logger = console, mcpToolExecutor = executeMcpToolCalls, maxActionCycles = MAX_MCP_ACTION_CYCLES }) {
+  const mcpToken = await getMcpIdToken(googleAuth, config.juanMcpAudience);
 
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), 60_000);
   try {
-    const result = await fetchImpl(GEMINI_INTERACTIONS_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": config.geminiApiKey },
-      body: JSON.stringify(body),
-      signal: abort.signal,
+    let interaction = await postGeminiInteraction({
+      config, mcpToken, input: message, previousInteractionId, fetchImpl, signal: abort.signal,
     });
-    if (!result.ok) throw new GeminiUpstreamError(result.status, await safeGeminiErrorDetails(result));
-    const payload = await result.json();
-    const interaction = payload.interaction || payload;
-    logRequiresActionDiagnostics(interaction, logger);
+    let actionCycles = 0;
+
+    while (interaction?.status === "requires_action") {
+      logRequiresActionDiagnostics(interaction, logger);
+      if (actionCycles >= maxActionCycles) {
+        throw new GeminiToolLoopError("Juan reached the maximum number of travel research action cycles.");
+      }
+      const calls = extractMcpToolCalls(interaction);
+      if (!calls.length) {
+        throw new GeminiToolLoopError("Gemini requested an unsupported action instead of a Juan MCP tool call.");
+      }
+      actionCycles += 1;
+      const results = await mcpToolExecutor({ config, mcpToken, calls });
+      if (!Array.isArray(results) || results.length !== calls.length) {
+        throw new GeminiToolLoopError("Juan could not safely prepare the MCP tool results.");
+      }
+      interaction = await postGeminiInteraction({
+        config,
+        mcpToken,
+        input: results,
+        previousInteractionId: interaction.id || previousInteractionId,
+        fetchImpl,
+        signal: abort.signal,
+      });
+    }
     return {
-      interactionId: interaction.id || null,
-      outputText: extractOutputText(interaction),
-      status: interaction.status || null,
-      previousInteractionId: interaction.id || previousInteractionId || null,
+      interactionId: interaction?.id || null,
+      outputText: extractOutputText(interaction || {}),
+      status: interaction?.status || null,
+      previousInteractionId: interaction?.id || previousInteractionId || null,
     };
   } finally {
     clearTimeout(timer);
@@ -253,4 +391,19 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULT_JUAN_MCP_URL, GeminiUpstreamError, createApp, extractOutputText, getMcpIdToken, loadConfig, callGemini, safeGeminiErrorDetails };
+module.exports = {
+  DEFAULT_JUAN_MCP_URL,
+  MAX_MCP_ACTION_CYCLES,
+  GeminiUpstreamError,
+  GeminiToolLoopError,
+  callGemini,
+  createApp,
+  createGeminiRequestBody,
+  createMcpToolClient,
+  executeMcpToolCalls,
+  extractMcpToolCalls,
+  extractOutputText,
+  getMcpIdToken,
+  loadConfig,
+  safeGeminiErrorDetails,
+};
